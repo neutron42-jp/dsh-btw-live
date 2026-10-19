@@ -1,0 +1,298 @@
+/**
+ * `/btw` — a side question answered outside the conversation history.
+ *
+ * The point of this plugin is the one thing the session-fork based side-question
+ * plugins cannot do: it reads the live session log, so the turn that is running
+ * right now (its tool calls, their results, its assistant text) is part of the
+ * context. Nothing is written back to the model history, no tool runs on the
+ * caller's behalf, and the running turn is never interrupted.
+ *
+ * @module @local/btw-live
+ */
+
+/** Plugin name used by loader diagnostics. */
+export const name = 'btw-live';
+
+/** The command registry and the model seam are the only services needed. */
+export const inject = ['commands', 'llm'];
+
+const DEFAULTS = {
+  maxEvents: 80,
+  maxChars: 16000,
+  toolArgChars: 300,
+  toolResultChars: 900,
+  maxTokens: 4096,
+  timeoutMs: 120000,
+};
+
+const SYSTEM = [
+  'You are a one-shot side-question assistant for a DeepSeek Harness session.',
+  'The transcript below is this session\'s live log. Lines marked ">>" belong to the turn that is running right now.',
+  'Answer only the question that follows the transcript.',
+  'Never continue the transcript\'s task, never propose or perform tool calls, never claim you changed anything.',
+  'When the question asks about progress or current state, describe exactly what the transcript shows and say which parts are still in progress.',
+  'Answer in the language of the question, concisely.',
+].join(' ');
+
+/**
+ * Collect every text fragment of a content-block list.
+ *
+ * @param {unknown} content - A message content array.
+ * @returns {string} The joined text.
+ */
+function blocksText(content) {
+  if (!Array.isArray(content)) return '';
+  const parts = [];
+  for (const block of content) {
+    if (typeof block === 'string') parts.push(block);
+    else if (block && typeof block === 'object' && typeof block.text === 'string' && block.text !== '') parts.push(block.text);
+  }
+  return parts.join('\n').trim();
+}
+
+/**
+ * Bound one rendered fragment.
+ *
+ * @param {string} value - Text to bound.
+ * @param {number} limit - Maximum characters.
+ * @returns {string} The bounded text.
+ */
+function clip(value, limit) {
+  const text = String(value ?? '').replace(/\s+/g, ' ').trim();
+  return text.length <= limit ? text : `${text.slice(0, limit)}…`;
+}
+
+/**
+ * Read the tool-call id of a result event across the shapes the log uses.
+ *
+ * @param {any} data - Event data.
+ * @returns {string} The call id, or an empty string.
+ */
+function resultCallId(data) {
+  return (
+    data?.toolCallId ??
+    data?.meta?.toolCallId ??
+    data?.meta?.callId ??
+    data?.message?.source?.callId ??
+    ''
+  );
+}
+
+/**
+ * Render one session event as one transcript line, or null for noise.
+ *
+ * @param {{ type?: string, data?: any }} event - Session event.
+ * @param {typeof DEFAULTS} limits - Rendering limits.
+ * @param {Map<string, string>} [names] - Tool-call id to tool name.
+ * @returns {string | null} The rendered line.
+ */
+function renderEvent(event, limits, names = new Map()) {
+  const data = event?.data ?? {};
+  switch (event?.type) {
+    case 'user/message':
+      return `[user] ${clip(blocksText(data.content), 2000)}`;
+    case 'assistant/message':
+      return `[assistant] ${clip(blocksText(data.message?.content), 2000)}`;
+    case 'tool/call':
+      return `[tool call] ${data.name}(${clip(data.arguments, limits.toolArgChars)})`;
+    case 'tool/result': {
+      const id = resultCallId(data);
+      const label = names.get(id) ?? (id === '' ? 'unknown' : clip(id, 24));
+      return `[tool result ${label}] ${clip(blocksText(data.message?.content), limits.toolResultChars)}`;
+    }
+    case 'todo/write':
+      return `[todos] ${clip((data.todos ?? []).map((todo) => `${todo.status}:${todo.content}`).join(' | '), 700)}`;
+    case 'job/registered':
+      return `[job started] ${clip(data.jobId, 32)} ${clip(data.label, 200)}`;
+    case 'job/settled':
+      return `[job settled] ${clip(data.jobId, 32)} ${clip(JSON.stringify(data.status ?? data.outcome ?? ''), 120)}`;
+    case 'working-directory/change':
+      return `[cwd] ${clip(data.cwd, 200)}`;
+    case 'turn/start':
+      return `-- turn ${clip(data.turn, 12)} start`;
+    case 'turn/end':
+      return `-- turn ${clip(data.turn, 12)} end`;
+    default:
+      return null;
+  }
+}
+
+/**
+ * Build the transcript for one session, marking the still-running turn.
+ *
+ * @param {any} session - The agent's session handle.
+ * @param {typeof DEFAULTS} limits - Rendering limits.
+ * @returns {string} The transcript.
+ */
+function transcript(session, limits) {
+  let events = [];
+  try {
+    if (typeof session?.snapshotEvents === 'function') events = session.snapshotEvents() ?? [];
+  } catch {
+    events = [];
+  }
+  if (!Array.isArray(events) || events.length === 0) return '(no session events yet)';
+
+  const tail = events.slice(-limits.maxEvents);
+  let lastTurnEnd = -1;
+  for (let index = tail.length - 1; index >= 0; index -= 1) {
+    if (tail[index]?.type === 'turn/end') {
+      lastTurnEnd = index;
+      break;
+    }
+  }
+
+  const lines = [];
+  const names = new Map();
+  for (const event of tail) {
+    if (event?.type === 'tool/call' && typeof event.data?.callId === 'string') names.set(event.data.callId, event.data.name ?? 'tool');
+  }
+  let used = 0;
+  for (let index = 0; index < tail.length; index += 1) {
+    const line = renderEvent(tail[index], limits, names);
+    if (line === null) continue;
+    const marked = index > lastTurnEnd ? `>> ${line}` : line;
+    if (used + marked.length > limits.maxChars) break;
+    used += marked.length;
+    lines.push(marked);
+  }
+  return lines.join('\n') || '(nothing renderable yet)';
+}
+
+/**
+ * Run one side question against the live session and return the answer text.
+ *
+ * @param {any} ctx - Plugin context.
+ * @param {any} agent - The agent the command was invoked against.
+ * @param {string} question - The raw question.
+ * @param {typeof DEFAULTS} limits - Rendering and timeout limits.
+ * @returns {Promise<string>} The answer text.
+ */
+async function answer(ctx, agent, question, limits) {
+  const selection = ctx.get('agentDefaultModel')?.currentSelection?.() ?? {};
+  const provider = selection.provider;
+  const model = selection.model;
+  if (typeof provider !== 'string' || typeof model !== 'string') {
+    throw new Error('no provider/model selection is available for the side question');
+  }
+
+  const live = transcript(agent?.session, limits);
+  const running = live.includes('\n>> ') || live.startsWith('>> ');
+  const request = [
+    'Session transcript (newest last).',
+    running ? 'Lines marked ">>" are the turn running right now.' : 'No turn is running right now.',
+    '',
+    live,
+    '',
+    '---',
+    `Question: ${question}`,
+  ].join('\n');
+
+  // A side question wants a fast answer, so ask the adapter for its lowest
+  // reasoning effort when the model exposes a ladder. Failure to resolve the
+  // model is not fatal: the request then runs with adapter defaults.
+  let reasoningEffort;
+  try {
+    const info = await ctx.llm.resolveModelInfo?.(provider, model);
+    const first = info?.reasoning?.efforts?.[0]?.id;
+    if (typeof first === 'string') reasoningEffort = first;
+  } catch {
+    reasoningEffort = undefined;
+  }
+
+  const call = {
+    provider,
+    model,
+    system: SYSTEM,
+    messages: [{ role: 'user', content: [{ type: 'text', text: request }] }],
+    maxTokens: limits.maxTokens,
+  };
+  if (reasoningEffort !== undefined) call.reasoningEffort = reasoningEffort;
+
+  /** Consume one stream attempt and report everything it produced. */
+  const consume = async () => {
+    let deltaText = '';
+    let blockText = '';
+    let reasoningText = '';
+    let failure;
+    let finish = 'none';
+    const counts = {};
+    const blockTypes = [];
+    const stream = ctx.llm.stream({ ...call, signal: AbortSignal.timeout(limits.timeoutMs) });
+    for await (const chunk of stream) {
+      const type = String(chunk?.type ?? 'unknown');
+      counts[type] = (counts[type] ?? 0) + 1;
+      if (type === 'text-delta') deltaText += chunk.text ?? '';
+      else if (type === 'reasoning-delta') reasoningText += chunk.text ?? '';
+      else if (type === 'block-end') {
+        const block = chunk.block ?? {};
+        blockTypes.push(String(block.type ?? '?'));
+        if (block.type === 'text') blockText += `${block.text ?? ''}\n`;
+        else if (block.type === 'reasoning') reasoningText += `${block.text ?? ''}\n`;
+      } else if (type === 'finish') {
+        finish = String(chunk.kind ?? 'unknown');
+        if (chunk.kind !== 'success') failure = chunk.failure?.message ?? chunk.failure?.code ?? chunk.kind;
+      }
+    }
+    // Adapters that stream deltas also repeat the assembled block at
+    // `block-end`, so block text is only a fallback for delta-less adapters.
+    return {
+      text: (deltaText !== '' ? deltaText : blockText).trim(),
+      reasoning: reasoningText.trim(),
+      failure,
+      finish,
+      counts,
+      blockTypes,
+    };
+  };
+
+  let result = await consume();
+  // A provider hiccup can settle a request with no content at all; one retry
+  // turns an intermittent empty answer into an answer.
+  if (result.text === '' && result.reasoning === '' && result.failure === undefined) {
+    result = await consume();
+  }
+
+  if (result.text !== '') return result.text;
+  if (result.failure !== undefined) throw new Error(String(result.failure));
+  // A reasoning-only reply still answers what the user asked.
+  if (result.reasoning !== '') return result.reasoning;
+
+  const detail = Object.entries(result.counts).map(([key, value]) => `${key}=${value}`).join(' ');
+  throw new Error(
+    `the model returned no text after retry (finish=${result.finish} ${detail} blocks=[${result.blockTypes.join(',')}] provider=${provider} model=${model})`,
+  );
+}
+
+/** Exported for tests: the transcript renderer takes a session handle and returns prompt text. */
+export { renderEvent, transcript };
+
+/**
+ * Contribute the `btw` command.
+ *
+ * @param {any} ctx - Plugin context.
+ * @param {{ [key: string]: unknown }} [config] - Row config.
+ */
+export function apply(ctx, config = {}) {
+  const limits = { ...DEFAULTS, ...config };
+
+  ctx.effect(() =>
+    ctx.commands.register({
+      name: 'btw',
+      description: 'Ask a side question about this session, including the turn that is running now',
+      input: { hint: '<question>' },
+      handler: async ({ agent, rawInput }) => {
+        const question = String(rawInput ?? '').trim();
+        if (question === '') {
+          return { kind: 'error', text: 'Usage: /btw <question>' };
+        }
+        try {
+          return { kind: 'success', text: await answer(ctx, agent, question, limits) };
+        } catch (error) {
+          ctx.logger?.warn?.(`btw-live: ${String(error)}`);
+          return { kind: 'error', text: `btw failed: ${error instanceof Error ? error.message : String(error)}` };
+        }
+      },
+    }),
+  );
+}

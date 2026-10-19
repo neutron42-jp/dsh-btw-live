@@ -1,0 +1,8 @@
+# /btw that reads the live session log, including the turn that is still running.
+- insert:
+    - id: btw-live
+      name: '@local/btw-live'
+      config:
+        maxEvents: 80
+        maxChars: 16000
+        timeoutMs: 120000

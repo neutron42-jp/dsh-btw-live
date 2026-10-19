@@ -1,0 +1,29 @@
+{
+  "name": "@local/btw-live",
+  "version": "1.1.0",
+  "private": true,
+  "type": "module",
+  "description": "/btw for DeepSeek Harness: a side question about the live session, including the running turn; the answer stays out of the conversation history.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/neutron42-jp/dsh-btw-live.git"
+  },
+  "homepage": "https://github.com/neutron42-jp/dsh-btw-live#readme",
+  "keywords": ["dsh", "deepseek-harness", "dsh-plugin"],
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": ["index.js", "client.js", "cordis.patch.yml", "locale/*.json", "icon.svg"],
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "platform": "web",
+      "inject": ["@deepseek-ai/dsh-client-ui-primitives"]
+    }
+  }
+}

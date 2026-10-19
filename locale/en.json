@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "BTW (live context)",
+    "description": "Adds /btw: a side question about this session, including the turn that is running right now. The answer stays out of the conversation history."
+  }
+}
