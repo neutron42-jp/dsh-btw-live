@@ -1,6 +1,6 @@
 {
   "name": "@local/btw-live",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "private": true,
   "type": "module",
   "description": "/btw for DeepSeek Harness: a side question about the live session, including the running turn; the answer stays out of the conversation history.",

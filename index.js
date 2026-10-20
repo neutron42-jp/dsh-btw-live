@@ -207,6 +207,55 @@ const RETRYABLE_CODES = new Set(['EMPTY_RESPONSE', 'PI_AI_ERROR', 'TIMEOUT', 'TR
 const effortRejected = new Set();
 
 /**
+ * Resolve the model the session itself is using.
+ *
+ * `agentDefaultModel` is the deployment default, which is also what a NEW
+ * session starts on — not the session's own choice. The composer's model
+ * picker installs a session-local selection first (and saves the default in
+ * the background, which may fail), so the order the session controller uses
+ * is: a pending selection, then the header of the last request, then the
+ * default.
+ *
+ * @param {any} ctx - Plugin context.
+ * @param {any} agent - The agent the command was invoked against.
+ * @returns {{ provider?: string, model?: string, reasoningEffort?: string }} The selection.
+ */
+function sessionSelection(ctx, agent) {
+  const session = agent?.session;
+  // 1. A selection made for the next request but not yet applied to one.
+  try {
+    const pending = ctx.get('sessionProjections')?.stateOf?.(session, 'modelSelection')?.pending;
+    if (pending !== null && typeof pending === 'object'
+      && typeof pending.provider === 'string' && typeof pending.model === 'string') {
+      return pending;
+    }
+  } catch {
+    // No projection registry in this deployment: fall through to the header.
+  }
+  // 2. The route the last request actually used.
+  let header;
+  try {
+    header = session?.requestHeader?.();
+  } catch {
+    header = undefined;
+  }
+  const config = header?.config;
+  if (config !== null && typeof config === 'object'
+    && typeof config.provider === 'string' && typeof config.model === 'string') {
+    const effort = config.reasoningEffort === undefined || header.adapterDefaults?.reasoningEffort === true
+      ? undefined
+      : config.reasoningEffort;
+    return {
+      provider: config.provider,
+      model: config.model,
+      ...(effort === undefined ? {} : { reasoningEffort: effort }),
+    };
+  }
+  // 3. A session that has not made a request yet uses the deployment default.
+  return ctx.get('agentDefaultModel')?.currentSelection?.() ?? {};
+}
+
+/**
  * Run one side question against the live session and return the answer text.
  *
  * @param {any} ctx - Plugin context.
@@ -216,7 +265,7 @@ const effortRejected = new Set();
  * @returns {Promise<string>} The answer text.
  */
 async function answer(ctx, agent, question, limits) {
-  const selection = ctx.get('agentDefaultModel')?.currentSelection?.() ?? {};
+  const selection = sessionSelection(ctx, agent);
   const provider = selection.provider;
   const model = selection.model;
   if (typeof provider !== 'string' || typeof model !== 'string') {
