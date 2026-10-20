@@ -201,12 +201,6 @@ function describeFailure(failure) {
 const RETRYABLE_CODES = new Set(['EMPTY_RESPONSE', 'PI_AI_ERROR', 'TIMEOUT', 'TRANSPORT']);
 
 /**
- * Provider/model routes whose provider rejected the fast shape once. The next
- * side question for the same route goes straight to the profile's own shape.
- */
-const effortRejected = new Set();
-
-/**
  * Resolve the model the session itself is using.
  *
  * `agentDefaultModel` is the deployment default, which is also what a NEW
@@ -284,17 +278,11 @@ async function answer(ctx, agent, question, limits) {
     `Question: ${question}`,
   ].join('\n');
 
-  // A side question wants a fast answer, so ask the adapter for its lowest
-  // reasoning effort when the model exposes a ladder. Failure to resolve the
-  // model is not fatal: the request then runs with adapter defaults.
-  let reasoningEffort;
-  try {
-    const info = await ctx.llm.resolveModelInfo?.(provider, model);
-    const first = info?.reasoning?.efforts?.[0]?.id;
-    if (typeof first === 'string') reasoningEffort = first;
-  } catch {
-    reasoningEffort = undefined;
-  }
+  // The answer must look like the one this session would have produced: same
+  // route, and the session's own reasoning effort (the adapter default when
+  // the selection names none). Only the output budget is capped, because a
+  // side question is not a task.
+  const effort = typeof selection.reasoningEffort === 'string' ? selection.reasoningEffort : undefined;
 
   /**
    * Consume one stream attempt and report everything it produced.
@@ -354,26 +342,19 @@ async function answer(ctx, agent, question, limits) {
     const usable = result.text !== '' || result.reasoning !== '';
     if (usable) return undefined;
     if (result.failure !== undefined && !RETRYABLE_CODES.has(String(result.failure.code))) return undefined;
-    // The fast shape (lowest effort, small budget) is a preference. A second
-    // attempt drops both so it matches the request the session itself is
-    // already making successfully, instead of repeating a rejected one.
-    return {};
+    // The cap is the only thing this request adds to the session's own shape;
+    // drop it so the second attempt matches what the session already sends.
+    return effort === undefined ? {} : { reasoningEffort: effort };
   };
 
-  const route = `${provider}/${model}`;
   const attempts = [];
-  const first = { maxTokens: limits.maxTokens };
-  if (reasoningEffort !== undefined && !effortRejected.has(route)) first.reasoningEffort = reasoningEffort;
+  const first = effort === undefined ? { maxTokens: limits.maxTokens } : { reasoningEffort: effort, maxTokens: limits.maxTokens };
   let result = await consume(first);
   attempts.push(result);
   const plan = retryPlan(result);
   if (plan !== undefined) {
     result = await consume(plan);
     attempts.push(result);
-    // Remember the route that refused the fast shape, so the next side
-    // question skips a request the provider is known to reject. The answer
-    // itself is unaffected: only the first attempt's shape changes.
-    if (first.reasoningEffort !== undefined && (result.text !== '' || result.reasoning !== '')) effortRejected.add(route);
   }
 
   if (result.text !== '') return result.text;
