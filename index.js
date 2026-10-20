@@ -283,10 +283,12 @@ async function answer(ctx, agent, question, limits) {
   // none), and the same conversation identity. Only the output budget is
   // capped, because a side question is not a task.
   //
-  // The identity is not cosmetic: OpenCode routes a request by its
-  // `x-opencode-session` header and rejects one without it
-  // (`400 MissingSessionID`), which is what the session's own requests carry
-  // and this one did not.
+  // `sessionId` is the seam's own field, not a provider special case: the
+  // agent loop passes it on every request and each adapter decides what to do
+  // with it. Providers that ignore it are unaffected; providers that route or
+  // cache by conversation (OpenCode rejects a request without it, OpenRouter
+  // uses it for affinity) accept the call exactly as they accept the session's
+  // own.
   const effort = typeof selection.reasoningEffort === 'string' ? selection.reasoningEffort : undefined;
   const sessionId = agent?.session?.id;
 

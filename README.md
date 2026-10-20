@@ -61,6 +61,8 @@ pnpm add link:/path/to/dsh-btw-live
 - `index.js`（ホスト側）— `commands` に `btw` を登録する。セッションログからトランスクリプトを組み、`llm` で1回だけストリームする。答えは `command/done` の `text` として返る。呼び出しにはセッションの `id` を `sessionId` として渡す（OpenCode 系は `x-opencode-session` でリクエストをルーティングし、無いと `400 MissingSessionID` で拒否する）
 - `client.js`（ブラウザ側）— `conversation.chat.commandview` の `btw` キーだけを差し替える。他のコマンドは汎用の行のまま。`locale` で ja / en / zh の辞書を持つ
 
+プロバイダ固有の分岐は無い。呼び出しはセッション本体と同形（`provider` / `model` / `reasoningEffort` / `sessionId`、システムプロンプトは契約どおり `system`、ツールなし）で、違うのは出力上限 4096 だけ。再試行の判定も `dsh-llm` のプロバイダ非依存な失敗コード（`EMPTY_RESPONSE` / `PI_AI_ERROR` / `TIMEOUT` / `TRANSPORT`）で行う。
+
 ## 失敗したとき
 
 カードには試行ごとの結末が出ます（`finish` の `reason.kind` と `failure.code` / HTTP status / メッセージ）。
