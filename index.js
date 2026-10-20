@@ -279,10 +279,16 @@ async function answer(ctx, agent, question, limits) {
   ].join('\n');
 
   // The answer must look like the one this session would have produced: same
-  // route, and the session's own reasoning effort (the adapter default when
-  // the selection names none). Only the output budget is capped, because a
-  // side question is not a task.
+  // route, same reasoning effort (the adapter default when the selection names
+  // none), and the same conversation identity. Only the output budget is
+  // capped, because a side question is not a task.
+  //
+  // The identity is not cosmetic: OpenCode routes a request by its
+  // `x-opencode-session` header and rejects one without it
+  // (`400 MissingSessionID`), which is what the session's own requests carry
+  // and this one did not.
   const effort = typeof selection.reasoningEffort === 'string' ? selection.reasoningEffort : undefined;
+  const sessionId = agent?.session?.id;
 
   /**
    * Consume one stream attempt and report everything it produced.
@@ -305,6 +311,7 @@ async function answer(ctx, agent, question, limits) {
       system: SYSTEM,
       messages: [{ role: 'user', content: [{ type: 'text', text: request }] }],
       maxTokens: plan.maxTokens,
+      ...(sessionId === undefined ? {} : { sessionId }),
     };
     if (plan.reasoningEffort !== undefined) call.reasoningEffort = plan.reasoningEffort;
     const stream = ctx.llm.stream({ ...call, signal: AbortSignal.timeout(limits.timeoutMs) });

@@ -58,7 +58,7 @@ pnpm add link:/path/to/dsh-btw-live
 
 ## 仕組み
 
-- `index.js`（ホスト側）— `commands` に `btw` を登録する。セッションログからトランスクリプトを組み、`llm` で1回だけストリームする。答えは `command/done` の `text` として返る
+- `index.js`（ホスト側）— `commands` に `btw` を登録する。セッションログからトランスクリプトを組み、`llm` で1回だけストリームする。答えは `command/done` の `text` として返る。呼び出しにはセッションの `id` を `sessionId` として渡す（OpenCode 系は `x-opencode-session` でリクエストをルーティングし、無いと `400 MissingSessionID` で拒否する）
 - `client.js`（ブラウザ側）— `conversation.chat.commandview` の `btw` キーだけを差し替える。他のコマンドは汎用の行のまま。`locale` で ja / en / zh の辞書を持つ
 
 ## 失敗したとき
