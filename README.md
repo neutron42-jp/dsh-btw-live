@@ -8,6 +8,7 @@ DeepSeek Harness の `/btw`。**いま動いているターンも含めて**セ�
 - 1回きりの LLM 呼び出し。ツールは実行せず、履歴にも書き込まない
 - 答えはトランスクリプト内の「BTW カード」で表示。Markdown、長い回答はカード内スクロール、ヘッダクリックで折りたたみ
 - 回答待ちの間は「考えています…」、失敗は赤字。回答が届くと自動で開く
+- 速さのため、最初の試行だけ最小の reasoning effort と小さめの出力上限で投げる。プロバイダがその形を拒否したら、そのモデルでは次回からプロファイル既定の形（セッション本体と同じ）で投げる
 
 ## 必要なもの
 
@@ -58,6 +59,17 @@ pnpm add link:/path/to/dsh-btw-live
 
 - `index.js`（ホスト側）— `commands` に `btw` を登録する。セッションログからトランスクリプトを組み、`llm` で1回だけストリームする。答えは `command/done` の `text` として返る
 - `client.js`（ブラウザ側）— `conversation.chat.commandview` の `btw` キーだけを差し替える。他のコマンドは汎用の行のまま。`locale` で ja / en / zh の辞書を持つ
+
+## 失敗したとき
+
+カードには試行ごとの結末が出ます（`finish` の `reason.kind` と `failure.code` / HTTP status / メッセージ）。
+
+```
+btw failed: no answer (#1 error PI_AI_ERROR HTTP 400 — …; #2 stop; provider=… model=…)
+```
+
+- `#1` が速い形（最小 effort・出力上限あり）、`#2` がプロファイル既定の形。2回目で成功すれば表示は成功のまま
+- 再試行しないコード: 認証・クォータ・コンテキスト超過など、同じ形で投げ直しても同じ結果になるもの
 
 ## ライセンス
 

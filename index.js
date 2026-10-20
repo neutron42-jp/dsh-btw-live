@@ -160,6 +160,53 @@ function transcript(session, limits) {
 }
 
 /**
+ * Read the terminal outcome of a `finish` chunk across the protocol shapes.
+ *
+ * The current seam carries `{ reason: { kind, failure? } }`; the shape this
+ * plugin originally read (`{ kind, failure? }`) is gone. Reading only the old
+ * field reported every outcome as `unknown` and dropped the failure the
+ * adapter had already classified, which is why an upstream rejection and an
+ * empty answer looked identical.
+ *
+ * @param {{ reason?: any, kind?: any, failure?: any }} chunk - Finish chunk.
+ * @returns {{ kind: string, failure?: any }} The reason and optional failure.
+ */
+function finishReason(chunk) {
+  const reason = chunk?.reason;
+  if (reason !== null && typeof reason === 'object' && typeof reason.kind === 'string') {
+    return { kind: reason.kind, ...(reason.failure === undefined ? {} : { failure: reason.failure }) };
+  }
+  const kind = typeof chunk?.kind === 'string' ? chunk.kind : 'unknown';
+  return { kind, ...(chunk?.failure === undefined ? {} : { failure: chunk.failure }) };
+}
+
+/**
+ * Render a classified failure as one short clause.
+ *
+ * @param {{ code?: string, status?: number, message?: string }} [failure] - Adapter failure.
+ * @returns {string} ` CODE HTTP 400 — message`, or an empty string.
+ */
+function describeFailure(failure) {
+  if (failure === undefined) return '';
+  const head = [failure.code, failure.status === undefined ? '' : `HTTP ${failure.status}`].filter(Boolean).join(' ');
+  const tail = typeof failure.message === 'string' && failure.message !== '' ? ` — ${failure.message}` : '';
+  return `${head === '' ? '' : ` ${head}`}${tail}`;
+}
+
+/**
+ * Failure codes where a second attempt can plausibly differ from the first.
+ * A rejected request (credential, quota, context overflow) fails the same way
+ * twice, so the command reports it instead of spending another call.
+ */
+const RETRYABLE_CODES = new Set(['EMPTY_RESPONSE', 'PI_AI_ERROR', 'TIMEOUT', 'TRANSPORT']);
+
+/**
+ * Provider/model routes whose provider rejected the fast shape once. The next
+ * side question for the same route goes straight to the profile's own shape.
+ */
+const effortRejected = new Set();
+
+/**
  * Run one side question against the live session and return the answer text.
  *
  * @param {any} ctx - Plugin context.
@@ -200,68 +247,97 @@ async function answer(ctx, agent, question, limits) {
     reasoningEffort = undefined;
   }
 
-  const call = {
-    provider,
-    model,
-    system: SYSTEM,
-    messages: [{ role: 'user', content: [{ type: 'text', text: request }] }],
-    maxTokens: limits.maxTokens,
-  };
-  if (reasoningEffort !== undefined) call.reasoningEffort = reasoningEffort;
-
-  /** Consume one stream attempt and report everything it produced. */
-  const consume = async () => {
+  /**
+   * Consume one stream attempt and report everything it produced.
+   *
+   * @param {{ reasoningEffort?: string, maxTokens?: number }} plan - Per-attempt request plan.
+   * @returns {Promise<{ text: string, reasoning: string, kind: string, failure?: any, counts: Record<string, number>, blockTypes: string[] }>} The attempt.
+   */
+  const consume = async (plan) => {
     let deltaText = '';
     let blockText = '';
-    let reasoningText = '';
+    let deltaReasoning = '';
+    let blockReasoning = '';
+    let kind = 'none';
     let failure;
-    let finish = 'none';
     const counts = {};
     const blockTypes = [];
+    const call = {
+      provider,
+      model,
+      system: SYSTEM,
+      messages: [{ role: 'user', content: [{ type: 'text', text: request }] }],
+      maxTokens: plan.maxTokens,
+    };
+    if (plan.reasoningEffort !== undefined) call.reasoningEffort = plan.reasoningEffort;
     const stream = ctx.llm.stream({ ...call, signal: AbortSignal.timeout(limits.timeoutMs) });
     for await (const chunk of stream) {
       const type = String(chunk?.type ?? 'unknown');
       counts[type] = (counts[type] ?? 0) + 1;
       if (type === 'text-delta') deltaText += chunk.text ?? '';
-      else if (type === 'reasoning-delta') reasoningText += chunk.text ?? '';
+      else if (type === 'reasoning-delta') deltaReasoning += chunk.text ?? '';
       else if (type === 'block-end') {
         const block = chunk.block ?? {};
         blockTypes.push(String(block.type ?? '?'));
         if (block.type === 'text') blockText += `${block.text ?? ''}\n`;
-        else if (block.type === 'reasoning') reasoningText += `${block.text ?? ''}\n`;
+        else if (block.type === 'reasoning') blockReasoning += `${block.text ?? ''}\n`;
       } else if (type === 'finish') {
-        finish = String(chunk.kind ?? 'unknown');
-        if (chunk.kind !== 'success') failure = chunk.failure?.message ?? chunk.failure?.code ?? chunk.kind;
+        const reason = finishReason(chunk);
+        kind = reason.kind;
+        failure = reason.failure;
       }
     }
     // Adapters that stream deltas also repeat the assembled block at
     // `block-end`, so block text is only a fallback for delta-less adapters.
     return {
       text: (deltaText !== '' ? deltaText : blockText).trim(),
-      reasoning: reasoningText.trim(),
-      failure,
-      finish,
+      reasoning: (deltaReasoning !== '' ? deltaReasoning : blockReasoning).trim(),
+      kind,
+      ...(failure === undefined ? {} : { failure }),
       counts,
       blockTypes,
     };
   };
 
-  let result = await consume();
-  // A provider hiccup can settle a request with no content at all; one retry
-  // turns an intermittent empty answer into an answer.
-  if (result.text === '' && result.reasoning === '' && result.failure === undefined) {
-    result = await consume();
+  /** Whether a finished-without-content attempt asks for a different second try. */
+  const retryPlan = (result) => {
+    if (result.kind === 'aborted') return undefined;
+    const usable = result.text !== '' || result.reasoning !== '';
+    if (usable) return undefined;
+    if (result.failure !== undefined && !RETRYABLE_CODES.has(String(result.failure.code))) return undefined;
+    // The fast shape (lowest effort, small budget) is a preference. A second
+    // attempt drops both so it matches the request the session itself is
+    // already making successfully, instead of repeating a rejected one.
+    return {};
+  };
+
+  const route = `${provider}/${model}`;
+  const attempts = [];
+  const first = { maxTokens: limits.maxTokens };
+  if (reasoningEffort !== undefined && !effortRejected.has(route)) first.reasoningEffort = reasoningEffort;
+  let result = await consume(first);
+  attempts.push(result);
+  const plan = retryPlan(result);
+  if (plan !== undefined) {
+    result = await consume(plan);
+    attempts.push(result);
+    // Remember the route that refused the fast shape, so the next side
+    // question skips a request the provider is known to reject. The answer
+    // itself is unaffected: only the first attempt's shape changes.
+    if (first.reasoningEffort !== undefined && (result.text !== '' || result.reasoning !== '')) effortRejected.add(route);
   }
 
   if (result.text !== '') return result.text;
-  if (result.failure !== undefined) throw new Error(String(result.failure));
   // A reasoning-only reply still answers what the user asked.
   if (result.reasoning !== '') return result.reasoning;
 
-  const detail = Object.entries(result.counts).map(([key, value]) => `${key}=${value}`).join(' ');
-  throw new Error(
-    `the model returned no text after retry (finish=${result.finish} ${detail} blocks=[${result.blockTypes.join(',')}] provider=${provider} model=${model})`,
-  );
+  const seen = attempts
+    .map((attempt, index) => {
+      const detail = Object.entries(attempt.counts).map(([key, value]) => `${key}=${value}`).join(' ');
+      return `#${index + 1} ${attempt.kind}${describeFailure(attempt.failure)} [${detail}] blocks=[${attempt.blockTypes.join(',')}]`;
+    })
+    .join('; ');
+  throw new Error(`no answer (${seen}; provider=${provider} model=${model})`);
 }
 
 /** Exported for tests: the transcript renderer takes a session handle and returns prompt text. */
